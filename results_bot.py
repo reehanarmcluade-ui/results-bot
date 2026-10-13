@@ -10,6 +10,7 @@ What it does each time it runs:
    with a rating: Excellent, Good, Average or Poor.
 """
 
+import io
 import json
 import os
 import sys
@@ -18,6 +19,7 @@ from datetime import datetime, timedelta
 
 import requests
 import yfinance as yf
+from PIL import Image, ImageDraw, ImageFont
 
 # ----------------------------- SETTINGS ------------------------------
 MIN_MARKET_CAP_CRORE = 500      # only post companies bigger than this
@@ -216,6 +218,121 @@ def send_telegram(text):
         raise RuntimeError(f"Telegram error: {r.status_code} {r.text}")
 
 
+# ----------------------------- IMAGE CARD ------------------------------
+TAG_COLORS = {"Excellent": (27, 158, 90), "Good": (47, 111, 222),
+              "Average": (214, 150, 0), "Poor": (211, 63, 73)}
+GREEN, RED = (27, 158, 90), (211, 63, 73)
+INK, GREY, LINE = (28, 33, 43), (112, 120, 135), (226, 229, 235)
+FONT_DIRS = ["/usr/share/fonts/truetype/dejavu/", "/usr/share/fonts/dejavu/"]
+
+
+def font(size, bold=False):
+    name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+    for d in FONT_DIRS:
+        try:
+            return ImageFont.truetype(d + name, size)
+        except Exception:
+            pass
+    return ImageFont.load_default()
+
+
+def money(x):
+    sign = "-" if x < 0 else ""
+    return f"{sign}₹{abs(crore(x)):,.0f} Cr"
+
+
+def fit(draw, text, f, max_w):
+    while draw.textlength(text, font=f) > max_w and len(text) > 4:
+        text = text[:-2].rstrip() + "…"
+    return text
+
+
+def render_card_image(name, symbol, n, test=False):
+    sales_g = pct_change(n["sales"], n["sales_ly"])
+    profit_g = pct_change(n["profit"], n["profit_ly"])
+    m = n["profit"] / n["sales"] * 100
+    m_ly = n["profit_ly"] / n["sales_ly"] * 100
+    diff = m - m_ly
+    tag, _ = rate(sales_g, profit_g, diff, n["profit"], n["profit_ly"])
+    color = TAG_COLORS[tag]
+    q = n["quarter"].strftime("%b %Y")
+
+    W, H = 1000, 700
+    img = Image.new("RGB", (W, H), (246, 247, 249))
+    d = ImageDraw.Draw(img)
+
+    # header band
+    d.rectangle([0, 0, W, 165], fill=color)
+    d.text((40, 30), fit(d, name, font(42, True), 600), font=font(42, True), fill="white")
+    d.text((40, 95), f"{symbol}   |   Quarter ended {q}", font=font(24), fill=(255, 255, 255))
+    # rating badge
+    bf = font(34, True)
+    bw = d.textlength(tag.upper(), font=bf) + 60
+    d.rounded_rectangle([W - 40 - bw, 45, W - 40, 115], radius=35, fill="white")
+    d.text((W - 40 - bw / 2, 80), tag.upper(), font=bf, fill=color, anchor="mm")
+
+    def change(x_right, y, g, suffix):
+        """colored triangle + number, right-aligned at x_right"""
+        if g is None:
+            d.text((x_right, y), "n/a", font=font(34, True), fill=GREY, anchor="ra")
+            return
+        c = GREEN if g >= 0 else RED
+        txt = f"{abs(g):.1f}{suffix}"
+        f = font(36, True)
+        tw = d.textlength(txt, font=f)
+        d.text((x_right, y), txt, font=f, fill=c, anchor="ra")
+        tx = x_right - tw - 34
+        if g >= 0:
+            d.polygon([(tx, y + 38), (tx + 26, y + 38), (tx + 13, y + 10)], fill=c)
+        else:
+            d.polygon([(tx, y + 10), (tx + 26, y + 10), (tx + 13, y + 38)], fill=c)
+
+    rows = [
+        ("SALES", money(n["sales"]), "Last year  " + money(n["sales_ly"]), sales_g, "%"),
+        ("NET PROFIT", money(n["profit"]), "Last year  " + money(n["profit_ly"]), profit_g, "%"),
+        ("PROFIT MARGIN", f"{m:.1f}%", f"Last year  {m_ly:.1f}%", diff, " pts"),
+    ]
+    y = 200
+    for label, val, ly, g, suf in rows:
+        d.text((40, y), label, font=font(22, True), fill=GREY)
+        d.text((40, y + 34), val, font=font(46, True), fill=INK)
+        d.text((40, y + 96), ly, font=font(24), fill=GREY)
+        change(W - 40, y + 50, g, suf)
+        d.line([40, y + 140, W - 40, y + 140], fill=LINE, width=2)
+        y += 155
+
+    # footer
+    d.text((40, 668), f"Market cap  {money(n['mcap'])}", font=font(24, True), fill=INK, anchor="lm")
+    d.text((W - 40, 668), "Automatic summary, not investment advice", font=font(18),
+           fill=GREY, anchor="rm")
+    if test:
+        d.text((W - 40, 176), "TEST - NOT REAL DATA", font=font(20, True),
+               fill=RED, anchor="ra")
+
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue(), tag
+
+
+def send_photo(png, caption):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    r = requests.post(url, data={"chat_id": CHANNEL, "caption": caption},
+                      files={"photo": ("card.png", png, "image/png")}, timeout=60)
+    if not r.ok:
+        raise RuntimeError(f"Telegram error: {r.status_code} {r.text}")
+
+
+def send_card(name, symbol, n, test=False):
+    """Send the result as an image. If drawing fails, fall back to text."""
+    try:
+        png, tag = render_card_image(name, symbol, n, test)
+        send_photo(png, f"{name} ({symbol}): {tag}")
+    except Exception as e:
+        print(f"Image failed ({e}), sending text instead")
+        prefix = "🧪 <b>TEST CARD (not real data)</b>\n\n" if test else ""
+        send_telegram(prefix + build_card(name, symbol, n))
+
+
 # -------------------------------- MAIN --------------------------------
 def main():
     if not BOT_TOKEN or not CHANNEL:
@@ -233,8 +350,7 @@ def main():
         for name, sym, s, sly, p, ply in samples:
             n = dict(sales=s, sales_ly=sly, profit=p, profit_ly=ply,
                      mcap=8000e7, quarter=datetime(2026, 9, 30))
-            send_telegram("🧪 <b>TEST CARD (not real data)</b>\n\n"
-                          + build_card(name, sym, n))
+            send_card(name, sym, n, test=True)
             time.sleep(3)
         print("Test cards sent.")
         return
@@ -295,7 +411,7 @@ def main():
             continue
 
         try:
-            send_telegram(build_card(p["name"], p["symbol"], n))
+            send_card(p["name"], p["symbol"], n)
             print(f"{p['symbol']}: posted")
             done.add(key); del pending[key]
             time.sleep(3)

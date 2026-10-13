@@ -1,17 +1,22 @@
 name: NSE results bot
- 
+
 on:
   schedule:
     - cron: "*/15 * * * *"   # every 15 minutes
   workflow_dispatch:          # lets you press a "Run workflow" button manually
- 
+    inputs:
+      test_mode:
+        description: "Tick this to send 4 sample cards (test)"
+        type: boolean
+        default: false
+
 permissions:
   contents: write             # lets the bot save its memory file (state.json)
- 
+
 concurrency:
   group: results-bot
   cancel-in-progress: false
- 
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
@@ -19,26 +24,26 @@ jobs:
     steps:
       - name: Get the code
         uses: actions/checkout@v4
- 
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
- 
+
       - name: Install libraries
         run: pip install -r requirements.txt
- 
+
       - name: Run the bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHANNEL: ${{ secrets.TELEGRAM_CHANNEL }}
+          TEST_MODE: ${{ github.event.inputs.test_mode == 'true' && '1' || '0' }}
         run: python results_bot.py
- 
+
       - name: Save the bot's memory
         run: |
           git config user.name "results-bot"
           git config user.email "results-bot@users.noreply.github.com"
           git add state.json || true
           git diff --cached --quiet || (git commit -m "update state" && git push)
- 
